@@ -19,7 +19,9 @@ trajectory = [
 % Dead-reckoning update interval.  In an onboard implementation this is the
 % control-loop or sensor-fusion cycle time.
 sampleTime = 1.0;       % seconds
-playbackInRealTime = false;  % set true to pause sampleTime seconds per update
+playbackInRealTime = false;  % set true to pause sampleTime seconds inside the simulation loop
+animationSpeedup = 12;       % 1 = real time, 12 = play the 245 s route in about 20 s
+showStaticPlots = true;      % keep summary plots after the animated flight
 
 % Simple velocity-sensor model in the local ENU frame.  Keep both at zero for
 % ideal dead reckoning, or increase them to see drift accumulate over time.
@@ -44,34 +46,104 @@ results = table( ...
     'VariableNames', {'time_s','latitude_deg','longitude_deg','altitude_m','east_m','north_m','up_m'});
 disp(results(1:min(10,height(results)),:));
 
-%% Plot 3-D trajectory in local ENU coordinates
-figure('Name', '3-D Curved UAV Dead Reckoning');
-plot3(flightLog.referenceENU(:,1), flightLog.referenceENU(:,2), flightLog.referenceENU(:,3), ...
-    '--', 'LineWidth', 1.4, 'DisplayName', 'Curved reference trajectory');
-hold on;
-plot3(flightLog.deadReckonedENU(:,1), flightLog.deadReckonedENU(:,2), flightLog.deadReckonedENU(:,3), ...
-    '-', 'LineWidth', 1.5, 'DisplayName', 'Dead-reckoned trajectory');
-scatter3(trajectoryModel.waypointENU(:,1), trajectoryModel.waypointENU(:,2), trajectoryModel.waypointENU(:,3), ...
-    45, 'filled', 'DisplayName', 'Timed control points');
-grid on; axis equal;
-xlabel('East (m)'); ylabel('North (m)'); zlabel('Up / altitude change (m)');
-title('3-D Curved Time-Stepped UAV Dead Reckoning');
-legend('Location', 'best');
-view(38, 24);
+%% Animate the UAV flying the trajectory over time
+animateFlightTrajectory(flightLog, trajectoryModel, animationSpeedup);
 
-%% Optional 2-D map view with altitude encoded by marker colour
-figure('Name', 'Map View with Altitude');
-geoplot(trajectory(:,2), trajectory(:,3), 'o', 'LineWidth', 1.1, 'DisplayName', 'Timed control points');
-hold on;
-geoscatter(flightLog.referenceLatitude, flightLog.referenceLongitude, 10, flightLog.referenceAltitude, ...
-    'filled', 'DisplayName', 'Sampled curved reference');
-geoscatter(flightLog.latitude, flightLog.longitude, 12, flightLog.altitude, 'filled', ...
-    'DisplayName', 'Dead-reckoned samples');
-geobasemap streets;
-cb = colorbar;
-cb.Label.String = 'Altitude (m)';
-title('Curved UAV Trajectory Samples');
-legend('Location', 'best');
+%% Optional static summary plots after the animation
+if showStaticPlots
+    figure('Name', '3-D Curved UAV Dead Reckoning');
+    plot3(flightLog.referenceENU(:,1), flightLog.referenceENU(:,2), flightLog.referenceENU(:,3), ...
+        '--', 'LineWidth', 1.4, 'DisplayName', 'Curved reference trajectory');
+    hold on;
+    plot3(flightLog.deadReckonedENU(:,1), flightLog.deadReckonedENU(:,2), flightLog.deadReckonedENU(:,3), ...
+        '-', 'LineWidth', 1.5, 'DisplayName', 'Dead-reckoned trajectory');
+    scatter3(trajectoryModel.waypointENU(:,1), trajectoryModel.waypointENU(:,2), trajectoryModel.waypointENU(:,3), ...
+        45, 'filled', 'DisplayName', 'Timed control points');
+    grid on; axis equal;
+    xlabel('East (m)'); ylabel('North (m)'); zlabel('Up / altitude change (m)');
+    title('3-D Curved Time-Stepped UAV Dead Reckoning');
+    legend('Location', 'best');
+    view(38, 24);
+
+    figure('Name', 'Map View with Altitude');
+    geoplot(trajectory(:,2), trajectory(:,3), 'o', 'LineWidth', 1.1, 'DisplayName', 'Timed control points');
+    hold on;
+    geoscatter(flightLog.referenceLatitude, flightLog.referenceLongitude, 10, flightLog.referenceAltitude, ...
+        'filled', 'DisplayName', 'Sampled curved reference');
+    geoscatter(flightLog.latitude, flightLog.longitude, 12, flightLog.altitude, 'filled', ...
+        'DisplayName', 'Dead-reckoned samples');
+    geobasemap streets;
+    cb = colorbar;
+    cb.Label.String = 'Altitude (m)';
+    title('Curved UAV Trajectory Samples');
+    legend('Location', 'best');
+end
+
+
+function animateFlightTrajectory(flightLog, model, animationSpeedup)
+%ANIMATEFLIGHTTRAJECTORY Replay the UAV trajectory sample by sample.
+    if animationSpeedup <= 0
+        error('animationSpeedup must be positive.');
+    end
+
+    allPositions = [flightLog.referenceENU; flightLog.deadReckonedENU; model.waypointENU];
+    padding = max(10, 0.08 .* max(max(allPositions, [], 1) - min(allPositions, [], 1)));
+    minLimits = min(allPositions, [], 1) - padding;
+    maxLimits = max(allPositions, [], 1) + padding;
+
+    figure('Name', 'Animated UAV Dead Reckoning');
+    axesHandle = axes;
+    hold(axesHandle, 'on');
+    grid(axesHandle, 'on');
+    axis(axesHandle, 'equal');
+    xlim(axesHandle, [minLimits(1), maxLimits(1)]);
+    ylim(axesHandle, [minLimits(2), maxLimits(2)]);
+    zlim(axesHandle, [minLimits(3), maxLimits(3)]);
+    xlabel(axesHandle, 'East (m)');
+    ylabel(axesHandle, 'North (m)');
+    zlabel(axesHandle, 'Up / altitude change (m)');
+    view(axesHandle, 38, 24);
+
+    plot3(axesHandle, model.waypointENU(:,1), model.waypointENU(:,2), model.waypointENU(:,3), ...
+        'ko', 'MarkerFaceColor', [0.2 0.2 0.2], 'DisplayName', 'Timed control points');
+
+    referenceTrail = animatedline(axesHandle, 'LineStyle', '--', 'LineWidth', 1.4, ...
+        'Color', [0.1 0.45 0.9], 'DisplayName', 'Reference flown so far');
+    deadReckonedTrail = animatedline(axesHandle, 'LineStyle', '-', 'LineWidth', 1.7, ...
+        'Color', [0.9 0.25 0.1], 'DisplayName', 'Dead-reckoned flown so far');
+
+    referenceAircraft = plot3(axesHandle, NaN, NaN, NaN, '^', 'MarkerSize', 9, ...
+        'MarkerFaceColor', [0.1 0.45 0.9], 'MarkerEdgeColor', 'k', 'DisplayName', 'Reference UAV');
+    deadReckonedAircraft = plot3(axesHandle, NaN, NaN, NaN, 'o', 'MarkerSize', 8, ...
+        'MarkerFaceColor', [0.9 0.25 0.1], 'MarkerEdgeColor', 'k', 'DisplayName', 'DR estimate');
+    velocityVector = quiver3(axesHandle, NaN, NaN, NaN, NaN, NaN, NaN, 0, ...
+        'Color', [0.1 0.1 0.1], 'LineWidth', 1.1, 'DisplayName', 'Measured velocity');
+
+    legend(axesHandle, 'Location', 'best');
+
+    for k = 1:numel(flightLog.time)
+        referencePosition = flightLog.referenceENU(k,:);
+        deadReckonedPosition = flightLog.deadReckonedENU(k,:);
+        measuredVelocity = flightLog.measuredVelocityENU(k,:);
+
+        addpoints(referenceTrail, referencePosition(1), referencePosition(2), referencePosition(3));
+        addpoints(deadReckonedTrail, deadReckonedPosition(1), deadReckonedPosition(2), deadReckonedPosition(3));
+
+        set(referenceAircraft, 'XData', referencePosition(1), 'YData', referencePosition(2), 'ZData', referencePosition(3));
+        set(deadReckonedAircraft, 'XData', deadReckonedPosition(1), 'YData', deadReckonedPosition(2), 'ZData', deadReckonedPosition(3));
+        set(velocityVector, ...
+            'XData', deadReckonedPosition(1), 'YData', deadReckonedPosition(2), 'ZData', deadReckonedPosition(3), ...
+            'UData', measuredVelocity(1), 'VData', measuredVelocity(2), 'WData', measuredVelocity(3));
+
+        title(axesHandle, sprintf('UAV Dead Reckoning Animation: t = %.1f s', flightLog.time(k)));
+        drawnow;
+
+        if k < numel(flightLog.time)
+            dt = flightLog.time(k+1) - flightLog.time(k);
+            pause(dt / animationSpeedup);
+        end
+    end
+end
 
 function [model, origin] = createCurvedTrajectoryModel(trajectory, sampleTime)
 %CREATECURVEDTRAJECTORYMODEL Build a cubic Hermite trajectory from timed points.

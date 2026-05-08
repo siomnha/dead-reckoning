@@ -11,19 +11,42 @@ This repository contains a MATLAB example of curved, time-stepped 3-D dead recko
 - timed control points are connected with a cubic Hermite curve, so the UAV follows a smooth trajectory rather than straight line segments;
 - the simulated flight advances one `sampleTime` at a time in `flyDeadReckoningLoop`, instead of generating and integrating the whole route in one vectorized step;
 - velocity measurements are integrated over time to estimate the dead-reckoned 3-D position;
+<<<<<<< codex/enhance-dead-reckoning-to-3d-trajectory-h4lszo
+- the UAV flight is replayed as a 3-D animation that advances according to the trajectory timestamps;
+=======
+>>>>>>> main
 - results are converted back to latitude, longitude, and altitude for display and map plotting.
 
 The implementation is self-contained and does not require MATLAB's `dreckon` function.  For short UAV routes it uses a spherical-earth local tangent approximation.  If you need survey-grade accuracy over larger areas, replace the helper conversions with Mapping Toolbox functions such as `geodetic2enu` and `enu2geodetic`.
 
+<<<<<<< codex/enhance-dead-reckoning-to-3d-trajectory-h4lszo
+## Animation and real-time playback
+
+After the dead-reckoning loop, the script opens an animated 3-D flight window.  The reference UAV marker and dead-reckoned estimate move along the trajectory sample by sample, while animated trails show where each has already flown.
+
+The animation uses `animationSpeedup` to control playback speed:
+
+```matlab
+animationSpeedup = 12;  % faster demo playback
+animationSpeedup = 1;   % true timestamp playback
+```
+
+By default, the simulation loop itself advances in simulation time without waiting, so the script computes quickly before replaying the animation.  To make the simulation loop wait like a real onboard loop too, set:
+=======
 ## Real-time playback
 
 By default, the loop advances in simulation time without waiting, so the script runs quickly.  To make the demo wait like a real onboard loop, set:
+>>>>>>> main
 
 ```matlab
 playbackInRealTime = true;
 ```
 
+<<<<<<< codex/enhance-dead-reckoning-to-3d-trajectory-h4lszo
+With that option enabled, each simulation update calls `pause(dt)` before the next sample is processed.
+=======
 With that option enabled, each update calls `pause(dt)` before the next sample is processed.
+>>>>>>> main
 
 ## Run
 
@@ -35,5 +58,11 @@ dead_reckoning
 
 The script prints the first time-stamped dead-reckoned samples and opens:
 
+<<<<<<< codex/enhance-dead-reckoning-to-3d-trajectory-h4lszo
+1. an animated 3-D local ENU view of the UAV flying over time;
+2. optional static summary plots comparing the curved reference trajectory with the dead-reckoned trajectory;
+3. a geographic map view where sample colour represents altitude.
+=======
 1. a 3-D local ENU plot comparing the curved reference trajectory with the dead-reckoned trajectory;
 2. a geographic map view where sample colour represents altitude.
+>>>>>>> main
