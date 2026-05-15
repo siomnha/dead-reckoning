@@ -1,8 +1,9 @@
-%% 3-D curved, time-stepped dead reckoning for a UAV trajectory
+%% 3-D curved, time-stepped IMU dead reckoning for a UAV trajectory
 % This example replaces 2-D straight waypoint segments with a timestamped 3-D
 % UAV trajectory.  The route between timed waypoints is a smooth cubic Hermite
-% curve, and the dead-reckoning estimate advances one sampling interval at a
-% time to mimic an onboard real-time update loop.
+% curve.  At each sampling interval the UAV now propagates with IMU data:
+% gyroscope angular velocity updates attitude, and accelerometer specific force
+% updates velocity and position.
 
 clear; clc;
 
@@ -16,25 +17,28 @@ trajectory = [
    245, 52.0660, -0.6250,  85
 ];
 
-% Dead-reckoning update interval.  In an onboard implementation this is the
-% control-loop or sensor-fusion cycle time.
+% IMU/dead-reckoning update interval.  In an onboard implementation this is
+% the sensor-fusion or inertial propagation cycle time.
 sampleTime = 1.0;       % seconds
 playbackInRealTime = false;  % set true to pause sampleTime seconds inside the simulation loop
 animationSpeedup = 12;       % 1 = real time, 12 = play the 245 s route in about 20 s
 showStaticPlots = true;      % keep summary plots after the animated flight
 
-% Simple velocity-sensor model in the local ENU frame.  Keep both at zero for
-% ideal dead reckoning, or increase them to see drift accumulate over time.
-velocityBiasENU = [0.02, -0.01, 0.005];  % [east north up] m/s
-velocityNoiseStd = 0.03;                 % m/s, set to 0 for deterministic output
-rng(7);                                  % repeatable noise for the demo
+% Simple IMU sensor model.  Gyroscope measurements are body-frame angular
+% velocity [rad/s].  Accelerometer measurements are body-frame specific force
+% [m/s^2], so gravity is added back during navigation-frame propagation.
+imuParams.gyroBiasBody = deg2rad([0.01, -0.015, 0.02]);       % [p q r] rad/s
+imuParams.gyroNoiseStd = deg2rad(0.02);                       % rad/s
+imuParams.accelBiasBody = [0.015, -0.010, 0.020];             % [fx fy fz] m/s^2
+imuParams.accelNoiseStd = 0.025;                              % m/s^2
+imuParams.gravityENU = [0, 0, -9.80665];                      % ENU gravity, up-positive
+rng(7);                                                       % repeatable noise for the demo
 
-%% Create the curved trajectory model and fly it one sample at a time
-[trajectoryModel, origin] = createCurvedTrajectoryModel(trajectory, sampleTime);
-flightLog = flyDeadReckoningLoop(trajectoryModel, sampleTime, playbackInRealTime, ...
-    velocityBiasENU, velocityNoiseStd, origin);
+%% Create the curved trajectory model and fly it one IMU sample at a time
+[trajectoryModel, origin] = createCurvedTrajectoryModel(trajectory, sampleTime, imuParams.gravityENU);
+flightLog = flyImuDeadReckoningLoop(trajectoryModel, sampleTime, playbackInRealTime, imuParams, origin);
 
-%% Print the first time-stamped DR samples
+%% Print the first time-stamped IMU DR samples
 results = table( ...
     flightLog.time(:), ...
     flightLog.latitude(:), ...
@@ -43,7 +47,18 @@ results = table( ...
     flightLog.deadReckonedENU(:,1), ...
     flightLog.deadReckonedENU(:,2), ...
     flightLog.deadReckonedENU(:,3), ...
-    'VariableNames', {'time_s','latitude_deg','longitude_deg','altitude_m','east_m','north_m','up_m'});
+    flightLog.deadReckonedVelocityENU(:,1), ...
+    flightLog.deadReckonedVelocityENU(:,2), ...
+    flightLog.deadReckonedVelocityENU(:,3), ...
+    flightLog.measuredAngularVelocityBody(:,1), ...
+    flightLog.measuredAngularVelocityBody(:,2), ...
+    flightLog.measuredAngularVelocityBody(:,3), ...
+    flightLog.measuredSpecificForceBody(:,1), ...
+    flightLog.measuredSpecificForceBody(:,2), ...
+    flightLog.measuredSpecificForceBody(:,3), ...
+    'VariableNames', {'time_s','latitude_deg','longitude_deg','altitude_m', ...
+    'east_m','north_m','up_m','ve_mps','vn_mps','vu_mps', ...
+    'gyro_p_radps','gyro_q_radps','gyro_r_radps','accel_fx_mps2','accel_fy_mps2','accel_fz_mps2'});
 disp(results(1:min(10,height(results)),:));
 
 %% Animate the UAV flying the trajectory over time
@@ -51,17 +66,17 @@ animateFlightTrajectory(flightLog, trajectoryModel, animationSpeedup);
 
 %% Optional static summary plots after the animation
 if showStaticPlots
-    figure('Name', '3-D Curved UAV Dead Reckoning');
+    figure('Name', '3-D Curved IMU Dead Reckoning');
     plot3(flightLog.referenceENU(:,1), flightLog.referenceENU(:,2), flightLog.referenceENU(:,3), ...
         '--', 'LineWidth', 1.4, 'DisplayName', 'Curved reference trajectory');
     hold on;
     plot3(flightLog.deadReckonedENU(:,1), flightLog.deadReckonedENU(:,2), flightLog.deadReckonedENU(:,3), ...
-        '-', 'LineWidth', 1.5, 'DisplayName', 'Dead-reckoned trajectory');
+        '-', 'LineWidth', 1.5, 'DisplayName', 'IMU dead-reckoned trajectory');
     scatter3(trajectoryModel.waypointENU(:,1), trajectoryModel.waypointENU(:,2), trajectoryModel.waypointENU(:,3), ...
         45, 'filled', 'DisplayName', 'Timed control points');
     grid on; axis equal;
     xlabel('East (m)'); ylabel('North (m)'); zlabel('Up / altitude change (m)');
-    title('3-D Curved Time-Stepped UAV Dead Reckoning');
+    title('3-D Curved Time-Stepped UAV IMU Dead Reckoning');
     legend('Location', 'best');
     view(38, 24);
 
@@ -71,12 +86,28 @@ if showStaticPlots
     geoscatter(flightLog.referenceLatitude, flightLog.referenceLongitude, 10, flightLog.referenceAltitude, ...
         'filled', 'DisplayName', 'Sampled curved reference');
     geoscatter(flightLog.latitude, flightLog.longitude, 12, flightLog.altitude, 'filled', ...
-        'DisplayName', 'Dead-reckoned samples');
+        'DisplayName', 'IMU dead-reckoned samples');
     geobasemap streets;
     cb = colorbar;
     cb.Label.String = 'Altitude (m)';
-    title('Curved UAV Trajectory Samples');
+    title('Curved UAV IMU Dead-Reckoning Samples');
     legend('Location', 'best');
+
+    figure('Name', 'IMU Measurements');
+    tiledlayout(2,1);
+    nexttile;
+    plot(flightLog.time, flightLog.measuredAngularVelocityBody, 'LineWidth', 1.2);
+    grid on;
+    ylabel('Angular velocity (rad/s)');
+    legend('p','q','r', 'Location', 'best');
+    title('Measured Gyroscope Output');
+    nexttile;
+    plot(flightLog.time, flightLog.measuredSpecificForceBody, 'LineWidth', 1.2);
+    grid on;
+    xlabel('Time (s)');
+    ylabel('Specific force (m/s^2)');
+    legend('f_x','f_y','f_z', 'Location', 'best');
+    title('Measured Accelerometer Output');
 end
 
 
@@ -91,7 +122,7 @@ function animateFlightTrajectory(flightLog, model, animationSpeedup)
     minLimits = min(allPositions, [], 1) - padding;
     maxLimits = max(allPositions, [], 1) + padding;
 
-    figure('Name', 'Animated UAV Dead Reckoning');
+    figure('Name', 'Animated UAV IMU Dead Reckoning');
     axesHandle = axes;
     hold(axesHandle, 'on');
     grid(axesHandle, 'on');
@@ -110,21 +141,21 @@ function animateFlightTrajectory(flightLog, model, animationSpeedup)
     referenceTrail = animatedline(axesHandle, 'LineStyle', '--', 'LineWidth', 1.4, ...
         'Color', [0.1 0.45 0.9], 'DisplayName', 'Reference flown so far');
     deadReckonedTrail = animatedline(axesHandle, 'LineStyle', '-', 'LineWidth', 1.7, ...
-        'Color', [0.9 0.25 0.1], 'DisplayName', 'Dead-reckoned flown so far');
+        'Color', [0.9 0.25 0.1], 'DisplayName', 'IMU DR flown so far');
 
     referenceAircraft = plot3(axesHandle, NaN, NaN, NaN, '^', 'MarkerSize', 9, ...
         'MarkerFaceColor', [0.1 0.45 0.9], 'MarkerEdgeColor', 'k', 'DisplayName', 'Reference UAV');
     deadReckonedAircraft = plot3(axesHandle, NaN, NaN, NaN, 'o', 'MarkerSize', 8, ...
-        'MarkerFaceColor', [0.9 0.25 0.1], 'MarkerEdgeColor', 'k', 'DisplayName', 'DR estimate');
+        'MarkerFaceColor', [0.9 0.25 0.1], 'MarkerEdgeColor', 'k', 'DisplayName', 'IMU DR estimate');
     velocityVector = quiver3(axesHandle, NaN, NaN, NaN, NaN, NaN, NaN, 0, ...
-        'Color', [0.1 0.1 0.1], 'LineWidth', 1.1, 'DisplayName', 'Measured velocity');
+        'Color', [0.1 0.1 0.1], 'LineWidth', 1.1, 'DisplayName', 'Estimated velocity');
 
     legend(axesHandle, 'Location', 'best');
 
     for k = 1:numel(flightLog.time)
         referencePosition = flightLog.referenceENU(k,:);
         deadReckonedPosition = flightLog.deadReckonedENU(k,:);
-        measuredVelocity = flightLog.measuredVelocityENU(k,:);
+        estimatedVelocity = flightLog.deadReckonedVelocityENU(k,:);
 
         addpoints(referenceTrail, referencePosition(1), referencePosition(2), referencePosition(3));
         addpoints(deadReckonedTrail, deadReckonedPosition(1), deadReckonedPosition(2), deadReckonedPosition(3));
@@ -133,9 +164,9 @@ function animateFlightTrajectory(flightLog, model, animationSpeedup)
         set(deadReckonedAircraft, 'XData', deadReckonedPosition(1), 'YData', deadReckonedPosition(2), 'ZData', deadReckonedPosition(3));
         set(velocityVector, ...
             'XData', deadReckonedPosition(1), 'YData', deadReckonedPosition(2), 'ZData', deadReckonedPosition(3), ...
-            'UData', measuredVelocity(1), 'VData', measuredVelocity(2), 'WData', measuredVelocity(3));
+            'UData', estimatedVelocity(1), 'VData', estimatedVelocity(2), 'WData', estimatedVelocity(3));
 
-        title(axesHandle, sprintf('UAV Dead Reckoning Animation: t = %.1f s', flightLog.time(k)));
+        title(axesHandle, sprintf('UAV IMU Dead Reckoning Animation: t = %.1f s', flightLog.time(k)));
         drawnow;
 
         if k < numel(flightLog.time)
@@ -145,7 +176,7 @@ function animateFlightTrajectory(flightLog, model, animationSpeedup)
     end
 end
 
-function [model, origin] = createCurvedTrajectoryModel(trajectory, sampleTime)
+function [model, origin] = createCurvedTrajectoryModel(trajectory, sampleTime, gravityENU)
 %CREATECURVEDTRAJECTORYMODEL Build a cubic Hermite trajectory from timed points.
     validateTrajectory(trajectory, sampleTime);
 
@@ -159,65 +190,102 @@ function [model, origin] = createCurvedTrajectoryModel(trajectory, sampleTime)
     model.time = trajectory(:,1);
     model.waypointENU = waypointENU;
     model.waypointVelocityENU = waypointVelocityENU;
+    model.gravityENU = gravityENU;
 end
 
-function flightLog = flyDeadReckoningLoop(model, sampleTime, playbackInRealTime, biasENU, noiseStd, origin)
-%FLYDEADRECKONINGLOOP Advance the simulated UAV and DR estimate sample by sample.
+function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTime, imuParams, origin)
+%FLYIMUDEADRECKONINGLOOP Propagate attitude, velocity, and position from IMU.
     startTime = model.time(1);
     endTime = model.time(end);
     maxSamples = ceil((endTime - startTime) / sampleTime) + 2;
 
     time = zeros(maxSamples, 1);
     referenceENU = zeros(maxSamples, 3);
-    measuredVelocityENU = zeros(maxSamples, 3);
+    referenceVelocityENU = zeros(maxSamples, 3);
+    referenceAccelerationENU = zeros(maxSamples, 3);
+    measuredAngularVelocityBody = zeros(maxSamples, 3);
+    measuredSpecificForceBody = zeros(maxSamples, 3);
     deadReckonedENU = zeros(maxSamples, 3);
+    deadReckonedVelocityENU = zeros(maxSamples, 3);
+    deadReckonedEuler = zeros(maxSamples, 3);
 
     sampleIndex = 1;
     currentTime = startTime;
-    [referencePosition, referenceVelocity] = sampleCurvedTrajectory(model, currentTime);
-    measuredVelocity = makeVelocityMeasurement(referenceVelocity, biasENU, noiseStd);
-    deadReckonedPosition = referencePosition;
+    [referencePosition, referenceVelocity, referenceAcceleration] = sampleCurvedTrajectory(model, currentTime);
+    referenceAttitude = attitudeFromVelocity(referenceVelocity);
+    imuMeasurement = makeImuMeasurement(referenceAttitude, [], referenceAcceleration, sampleTime, imuParams);
 
-    time(sampleIndex) = currentTime;
-    referenceENU(sampleIndex,:) = referencePosition;
-    measuredVelocityENU(sampleIndex,:) = measuredVelocity;
-    deadReckonedENU(sampleIndex,:) = deadReckonedPosition;
+    deadReckonedPosition = referencePosition;
+    deadReckonedVelocity = referenceVelocity;
+    deadReckonedAttitude = referenceAttitude;
+
+    [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, ...
+        measuredSpecificForceBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler] = ...
+        logFlightSample(sampleIndex, currentTime, referencePosition, referenceVelocity, referenceAcceleration, ...
+        imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, time, referenceENU, ...
+        referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, measuredSpecificForceBody, ...
+        deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler);
 
     while currentTime < endTime
         nextTime = min(currentTime + sampleTime, endTime);
         dt = nextTime - currentTime;
 
+        [nextReferencePosition, nextReferenceVelocity, nextReferenceAcceleration] = sampleCurvedTrajectory(model, nextTime);
+        nextReferenceAttitude = attitudeFromVelocity(nextReferenceVelocity);
+        intervalImuMeasurement = makeImuMeasurement(nextReferenceAttitude, referenceAttitude, ...
+            referenceAcceleration, dt, imuParams);
+
         if playbackInRealTime
             pause(dt);
         end
 
-        % Dead reckoning is causal: propagate with the velocity measurement that
-        % was available during the previous sample interval.
-        deadReckonedPosition = deadReckonedPosition + measuredVelocity .* dt;
+        % Strapdown IMU propagation.  The interval gyro measurement integrates
+        % attitude; the interval accelerometer specific force is rotated into ENU
+        % and gravity is restored to obtain translational acceleration.
+        deadReckonedAttitude = deadReckonedAttitude * rotationExp(intervalImuMeasurement.angularVelocityBody .* dt);
+        estimatedAcceleration = deadReckonedAttitude * intervalImuMeasurement.specificForceBody.' + imuParams.gravityENU.';
+        estimatedAcceleration = estimatedAcceleration.';
+        deadReckonedPosition = deadReckonedPosition + deadReckonedVelocity .* dt + 0.5 .* estimatedAcceleration .* dt.^2;
+        deadReckonedVelocity = deadReckonedVelocity + estimatedAcceleration .* dt;
 
         currentTime = nextTime;
-        [referencePosition, referenceVelocity] = sampleCurvedTrajectory(model, currentTime);
-        measuredVelocity = makeVelocityMeasurement(referenceVelocity, biasENU, noiseStd);
+        referencePosition = nextReferencePosition;
+        referenceVelocity = nextReferenceVelocity;
+        referenceAcceleration = nextReferenceAcceleration;
+        referenceAttitude = nextReferenceAttitude;
+        imuMeasurement = intervalImuMeasurement;
 
         sampleIndex = sampleIndex + 1;
-        time(sampleIndex) = currentTime;
-        referenceENU(sampleIndex,:) = referencePosition;
-        measuredVelocityENU(sampleIndex,:) = measuredVelocity;
-        deadReckonedENU(sampleIndex,:) = deadReckonedPosition;
+        [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, ...
+            measuredSpecificForceBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler] = ...
+            logFlightSample(sampleIndex, currentTime, referencePosition, referenceVelocity, referenceAcceleration, ...
+            imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, time, referenceENU, ...
+            referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, measuredSpecificForceBody, ...
+            deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler);
     end
 
     time = time(1:sampleIndex);
     referenceENU = referenceENU(1:sampleIndex,:);
-    measuredVelocityENU = measuredVelocityENU(1:sampleIndex,:);
+    referenceVelocityENU = referenceVelocityENU(1:sampleIndex,:);
+    referenceAccelerationENU = referenceAccelerationENU(1:sampleIndex,:);
+    measuredAngularVelocityBody = measuredAngularVelocityBody(1:sampleIndex,:);
+    measuredSpecificForceBody = measuredSpecificForceBody(1:sampleIndex,:);
     deadReckonedENU = deadReckonedENU(1:sampleIndex,:);
+    deadReckonedVelocityENU = deadReckonedVelocityENU(1:sampleIndex,:);
+    deadReckonedEuler = deadReckonedEuler(1:sampleIndex,:);
 
     [latitude, longitude, altitude] = enuToGeodetic(deadReckonedENU, origin);
     [referenceLatitude, referenceLongitude, referenceAltitude] = enuToGeodetic(referenceENU, origin);
 
     flightLog.time = time;
     flightLog.referenceENU = referenceENU;
-    flightLog.measuredVelocityENU = measuredVelocityENU;
+    flightLog.referenceVelocityENU = referenceVelocityENU;
+    flightLog.referenceAccelerationENU = referenceAccelerationENU;
+    flightLog.measuredAngularVelocityBody = measuredAngularVelocityBody;
+    flightLog.measuredSpecificForceBody = measuredSpecificForceBody;
     flightLog.deadReckonedENU = deadReckonedENU;
+    flightLog.deadReckonedVelocityENU = deadReckonedVelocityENU;
+    flightLog.deadReckonedEuler = deadReckonedEuler;
     flightLog.latitude = latitude;
     flightLog.longitude = longitude;
     flightLog.altitude = altitude;
@@ -226,8 +294,26 @@ function flightLog = flyDeadReckoningLoop(model, sampleTime, playbackInRealTime,
     flightLog.referenceAltitude = referenceAltitude;
 end
 
-function [positionENU, velocityENU] = sampleCurvedTrajectory(model, queryTime)
-%SAMPLECURVEDTRAJECTORY Evaluate position and velocity on a cubic Hermite curve.
+function [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, ...
+    measuredSpecificForceBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler] = ...
+    logFlightSample(sampleIndex, currentTime, referencePosition, referenceVelocity, referenceAcceleration, ...
+    imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, time, referenceENU, ...
+    referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, measuredSpecificForceBody, ...
+    deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler)
+%LOGFLIGHTSAMPLE Store one reference, IMU, and propagated dead-reckoning state.
+    time(sampleIndex) = currentTime;
+    referenceENU(sampleIndex,:) = referencePosition;
+    referenceVelocityENU(sampleIndex,:) = referenceVelocity;
+    referenceAccelerationENU(sampleIndex,:) = referenceAcceleration;
+    measuredAngularVelocityBody(sampleIndex,:) = imuMeasurement.angularVelocityBody;
+    measuredSpecificForceBody(sampleIndex,:) = imuMeasurement.specificForceBody;
+    deadReckonedENU(sampleIndex,:) = deadReckonedPosition;
+    deadReckonedVelocityENU(sampleIndex,:) = deadReckonedVelocity;
+    deadReckonedEuler(sampleIndex,:) = attitudeToEulerZYX(deadReckonedAttitude);
+end
+
+function [positionENU, velocityENU, accelerationENU] = sampleCurvedTrajectory(model, queryTime)
+%SAMPLECURVEDTRAJECTORY Evaluate position, velocity, and acceleration on a Hermite curve.
     times = model.time;
     waypoints = model.waypointENU;
     waypointVelocities = model.waypointVelocityENU;
@@ -267,6 +353,13 @@ function [positionENU, velocityENU] = sampleCurvedTrajectory(model, queryTime)
     dh11 = 3*s^2 - 2*s;
 
     velocityENU = (dh00*p0 + dh10*duration*v0 + dh01*p1 + dh11*duration*v1) ./ duration;
+
+    ddh00 = 12*s - 6;
+    ddh10 = 6*s - 4;
+    ddh01 = -12*s + 6;
+    ddh11 = 6*s - 2;
+
+    accelerationENU = (ddh00*p0 + ddh10*duration*v0 + ddh01*p1 + ddh11*duration*v1) ./ duration.^2;
 end
 
 function waypointVelocityENU = estimateWaypointVelocities(time, waypointENU)
@@ -280,9 +373,88 @@ function waypointVelocityENU = estimateWaypointVelocities(time, waypointENU)
     end
 end
 
-function measurementENU = makeVelocityMeasurement(trueVelocityENU, biasENU, noiseStd)
-%MAKEVELOCITYMEASUREMENT Apply a simple bias/noise model to one ENU velocity.
-    measurementENU = trueVelocityENU + biasENU + noiseStd .* randn(1, 3);
+function imuMeasurement = makeImuMeasurement(currentAttitude, previousAttitude, accelerationENU, dt, imuParams)
+%MAKEIMUMEASUREMENT Simulate one gyro and accelerometer measurement.
+    if isempty(previousAttitude) || dt <= 0
+        trueAngularVelocityBody = [0, 0, 0];
+    else
+        trueAngularVelocityBody = rotationLog(previousAttitude.' * currentAttitude) ./ dt;
+    end
+
+    trueSpecificForceBody = (currentAttitude.' * (accelerationENU - imuParams.gravityENU).').';
+
+    imuMeasurement.angularVelocityBody = trueAngularVelocityBody + imuParams.gyroBiasBody + ...
+        imuParams.gyroNoiseStd .* randn(1, 3);
+    imuMeasurement.specificForceBody = trueSpecificForceBody + imuParams.accelBiasBody + ...
+        imuParams.accelNoiseStd .* randn(1, 3);
+end
+
+function attitude = attitudeFromVelocity(velocityENU)
+%ATTITUDEFROMVELOCITY Build a simple body-to-ENU attitude from flight direction.
+    speed = norm(velocityENU);
+    if speed < 1e-6
+        forward = [1, 0, 0];
+    else
+        forward = velocityENU ./ speed;
+    end
+
+    worldUp = [0, 0, 1];
+    left = cross(worldUp, forward);
+    if norm(left) < 1e-6
+        left = [0, 1, 0];
+    else
+        left = left ./ norm(left);
+    end
+    up = cross(forward, left);
+    up = up ./ norm(up);
+
+    attitude = [forward(:), left(:), up(:)];
+end
+
+function rotationMatrix = rotationExp(rotationVector)
+%ROTATIONEXP Convert a rotation vector to a rotation matrix with Rodrigues' formula.
+    angle = norm(rotationVector);
+    if angle < 1e-12
+        rotationMatrix = eye(3) + skewSymmetric(rotationVector);
+        return;
+    end
+
+    axis = rotationVector ./ angle;
+    axisSkew = skewSymmetric(axis);
+    rotationMatrix = eye(3) + sin(angle) .* axisSkew + (1 - cos(angle)) .* (axisSkew * axisSkew);
+end
+
+function rotationVector = rotationLog(rotationMatrix)
+%ROTATIONLOG Convert a rotation matrix to a rotation vector.
+    cosAngle = (trace(rotationMatrix) - 1) / 2;
+    cosAngle = max(-1, min(1, cosAngle));
+    angle = acos(cosAngle);
+
+    if angle < 1e-12
+        rotationVector = [0, 0, 0];
+        return;
+    end
+
+    rotationVector = angle ./ (2 .* sin(angle)) .* [
+        rotationMatrix(3,2) - rotationMatrix(2,3), ...
+        rotationMatrix(1,3) - rotationMatrix(3,1), ...
+        rotationMatrix(2,1) - rotationMatrix(1,2)];
+end
+
+function skew = skewSymmetric(vector)
+%SKEWSYMMETRIC Return the skew-symmetric matrix for a 3-D vector.
+    skew = [
+        0, -vector(3), vector(2);
+        vector(3), 0, -vector(1);
+        -vector(2), vector(1), 0];
+end
+
+function eulerZYX = attitudeToEulerZYX(attitude)
+%ATTITUDETOEULERZYX Convert body-to-ENU attitude to [yaw pitch roll] radians.
+    yaw = atan2(attitude(2,1), attitude(1,1));
+    pitch = atan2(-attitude(3,1), hypot(attitude(1,1), attitude(2,1)));
+    roll = atan2(attitude(3,2), attitude(3,3));
+    eulerZYX = [yaw, pitch, roll];
 end
 
 function enu = geodeticToENU(latitude, longitude, altitude, origin)
