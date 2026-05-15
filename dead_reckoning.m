@@ -35,11 +35,25 @@ imuParams.accelBiasBody = [0.002, -0.0015, 0.003];            % [ax ay az] m/s^2
 imuParams.accelNoiseStd = 0.005;                              % m/s^2
 imuParams.gravityENU = [0, 0, -9.80665];                      % ENU gravity, up-positive
 imuParams.accelerometerIncludesGravity = false;               % false avoids raw 1-g accelerometer offset
-rng(7);                                                       % repeatable noise for the demo
 
-%% Create the curved trajectory model and fly it one IMU sample at a time
+% Lidar-inertial odometry (LIO) scan-matching settings.  Landmarks are known
+% 3-D map points around the route; each scan observes nearby landmarks in the
+% body frame and the EKF fuses the scan-matched position with IMU propagation.
+lioParams.lidarRange = 180;                 % m
+lioParams.lidarNoiseStd = 0.35;             % m, per landmark body-frame point noise
+lioParams.minLandmarksForUpdate = 3;        % minimum correspondences for scan matching
+lioParams.initialPositionStd = 1.0;         % m
+lioParams.initialVelocityStd = 0.5;         % m/s
+lioParams.accelProcessNoiseStd = 0.08;      % m/s^2
+rng(7);                                    % repeatable noise for the demo
+
+%% Create the curved trajectory model, landmarks, and fly one IMU sample at a time
 [trajectoryModel, origin] = createCurvedTrajectoryModel(trajectory, sampleTime, imuParams.gravityENU);
-flightLog = flyImuDeadReckoningLoop(trajectoryModel, sampleTime, playbackInRealTime, imuParams, origin);
+consistencyReport = checkTrajectoryWaypointConsistency(trajectoryModel);
+disp(consistencyReport);
+landmarksENU = generatePredefinedLandmarks(trajectoryModel);
+flightLog = flyImuDeadReckoningLoop(trajectoryModel, sampleTime, playbackInRealTime, ...
+    imuParams, lioParams, landmarksENU, origin);
 
 %% Print the first time-stamped IMU DR samples
 results = table( ...
@@ -59,13 +73,25 @@ results = table( ...
     flightLog.measuredAccelerationBody(:,1), ...
     flightLog.measuredAccelerationBody(:,2), ...
     flightLog.measuredAccelerationBody(:,3), ...
+    flightLog.lioENU(:,1), ...
+    flightLog.lioENU(:,2), ...
+    flightLog.lioENU(:,3), ...
+    flightLog.lidarMatchedLandmarkCount(:), ...
     'VariableNames', {'time_s','latitude_deg','longitude_deg','altitude_m', ...
     'east_m','north_m','up_m','ve_mps','vn_mps','vu_mps', ...
-    'gyro_p_radps','gyro_q_radps','gyro_r_radps','accel_x_mps2','accel_y_mps2','accel_z_mps2'});
+    'gyro_p_radps','gyro_q_radps','gyro_r_radps','accel_x_mps2','accel_y_mps2','accel_z_mps2', ...
+    'lio_east_m','lio_north_m','lio_up_m','matched_landmarks'});
 disp(results(1:min(10,height(results)),:));
 
+pureImuError = vecnorm(flightLog.deadReckonedENU - flightLog.referenceENU, 2, 2);
+lioError = vecnorm(flightLog.lioENU - flightLog.referenceENU, 2, 2);
+comparison = table(flightLog.time(end), pureImuError(end), lioError(end), ...
+    mean(flightLog.lidarMatchedLandmarkCount), ...
+    'VariableNames', {'final_time_s','pure_imu_final_error_m','lio_final_error_m','mean_matched_landmarks'});
+disp(comparison);
+
 %% Animate the UAV flying the trajectory over time
-animateFlightTrajectory(flightLog, trajectoryModel, animationSpeedup);
+animateFlightTrajectory(flightLog, trajectoryModel, landmarksENU, animationSpeedup);
 
 %% Optional static summary plots after the animation
 if showStaticPlots
@@ -75,6 +101,10 @@ if showStaticPlots
     hold on;
     plot3(flightLog.deadReckonedENU(:,1), flightLog.deadReckonedENU(:,2), flightLog.deadReckonedENU(:,3), ...
         '-', 'LineWidth', 1.5, 'DisplayName', 'IMU dead-reckoned trajectory');
+    plot3(flightLog.lioENU(:,1), flightLog.lioENU(:,2), flightLog.lioENU(:,3), ...
+        '-', 'LineWidth', 1.5, 'DisplayName', 'LIO EKF trajectory');
+    plot3(landmarksENU(:,1), landmarksENU(:,2), landmarksENU(:,3), ...
+        'd', 'MarkerSize', 5, 'Color', [0.2 0.6 0.2], 'DisplayName', 'Predefined lidar landmarks');
     scatter3(trajectoryModel.waypointENU(:,1), trajectoryModel.waypointENU(:,2), trajectoryModel.waypointENU(:,3), ...
         45, 'filled', 'DisplayName', 'Timed control points');
     grid on; axis equal;
@@ -90,6 +120,8 @@ if showStaticPlots
         'filled', 'DisplayName', 'Sampled curved reference');
     geoscatter(flightLog.latitude, flightLog.longitude, 12, flightLog.altitude, 'filled', ...
         'DisplayName', 'IMU dead-reckoned samples');
+    geoscatter(flightLog.lioLatitude, flightLog.lioLongitude, 12, flightLog.lioAltitude, 'filled', ...
+        'DisplayName', 'LIO EKF samples');
     geobasemap streets;
     cb = colorbar;
     cb.Label.String = 'Altitude (m)';
@@ -114,13 +146,13 @@ if showStaticPlots
 end
 
 
-function animateFlightTrajectory(flightLog, model, animationSpeedup)
+function animateFlightTrajectory(flightLog, model, landmarksENU, animationSpeedup)
 %ANIMATEFLIGHTTRAJECTORY Replay the UAV trajectory sample by sample.
     if animationSpeedup <= 0
         error('animationSpeedup must be positive.');
     end
 
-    allPositions = [flightLog.referenceENU; flightLog.deadReckonedENU; model.waypointENU];
+    allPositions = [flightLog.referenceENU; flightLog.deadReckonedENU; flightLog.lioENU; model.waypointENU; landmarksENU];
     padding = max(10, 0.08 .* max(max(allPositions, [], 1) - min(allPositions, [], 1)));
     minLimits = min(allPositions, [], 1) - padding;
     maxLimits = max(allPositions, [], 1) + padding;
@@ -140,16 +172,22 @@ function animateFlightTrajectory(flightLog, model, animationSpeedup)
 
     plot3(axesHandle, model.waypointENU(:,1), model.waypointENU(:,2), model.waypointENU(:,3), ...
         'ko', 'MarkerFaceColor', [0.2 0.2 0.2], 'DisplayName', 'Timed control points');
+    plot3(axesHandle, landmarksENU(:,1), landmarksENU(:,2), landmarksENU(:,3), ...
+        'd', 'MarkerSize', 5, 'Color', [0.2 0.6 0.2], 'DisplayName', 'Lidar landmarks');
 
     referenceTrail = animatedline(axesHandle, 'LineStyle', '--', 'LineWidth', 1.4, ...
         'Color', [0.1 0.45 0.9], 'DisplayName', 'Reference flown so far');
     deadReckonedTrail = animatedline(axesHandle, 'LineStyle', '-', 'LineWidth', 1.7, ...
         'Color', [0.9 0.25 0.1], 'DisplayName', 'IMU DR flown so far');
+    lioTrail = animatedline(axesHandle, 'LineStyle', '-', 'LineWidth', 1.7, ...
+        'Color', [0.2 0.65 0.2], 'DisplayName', 'LIO EKF flown so far');
 
     referenceAircraft = plot3(axesHandle, NaN, NaN, NaN, '^', 'MarkerSize', 9, ...
         'MarkerFaceColor', [0.1 0.45 0.9], 'MarkerEdgeColor', 'k', 'DisplayName', 'Reference UAV');
     deadReckonedAircraft = plot3(axesHandle, NaN, NaN, NaN, 'o', 'MarkerSize', 8, ...
         'MarkerFaceColor', [0.9 0.25 0.1], 'MarkerEdgeColor', 'k', 'DisplayName', 'IMU DR estimate');
+    lioAircraft = plot3(axesHandle, NaN, NaN, NaN, 's', 'MarkerSize', 8, ...
+        'MarkerFaceColor', [0.2 0.65 0.2], 'MarkerEdgeColor', 'k', 'DisplayName', 'LIO EKF estimate');
     velocityVector = quiver3(axesHandle, NaN, NaN, NaN, NaN, NaN, NaN, 0, ...
         'Color', [0.1 0.1 0.1], 'LineWidth', 1.1, 'DisplayName', 'Estimated velocity');
 
@@ -158,13 +196,16 @@ function animateFlightTrajectory(flightLog, model, animationSpeedup)
     for k = 1:numel(flightLog.time)
         referencePosition = flightLog.referenceENU(k,:);
         deadReckonedPosition = flightLog.deadReckonedENU(k,:);
+        lioPosition = flightLog.lioENU(k,:);
         estimatedVelocity = flightLog.deadReckonedVelocityENU(k,:);
 
         addpoints(referenceTrail, referencePosition(1), referencePosition(2), referencePosition(3));
         addpoints(deadReckonedTrail, deadReckonedPosition(1), deadReckonedPosition(2), deadReckonedPosition(3));
+        addpoints(lioTrail, lioPosition(1), lioPosition(2), lioPosition(3));
 
         set(referenceAircraft, 'XData', referencePosition(1), 'YData', referencePosition(2), 'ZData', referencePosition(3));
         set(deadReckonedAircraft, 'XData', deadReckonedPosition(1), 'YData', deadReckonedPosition(2), 'ZData', deadReckonedPosition(3));
+        set(lioAircraft, 'XData', lioPosition(1), 'YData', lioPosition(2), 'ZData', lioPosition(3));
         set(velocityVector, ...
             'XData', deadReckonedPosition(1), 'YData', deadReckonedPosition(2), 'ZData', deadReckonedPosition(3), ...
             'UData', estimatedVelocity(1), 'VData', estimatedVelocity(2), 'WData', estimatedVelocity(3));
@@ -196,8 +237,111 @@ function [model, origin] = createCurvedTrajectoryModel(trajectory, sampleTime, g
     model.gravityENU = gravityENU;
 end
 
-function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTime, imuParams, origin)
-%FLYIMUDEADRECKONINGLOOP Propagate attitude, velocity, and position from IMU.
+function consistencyReport = checkTrajectoryWaypointConsistency(model)
+%CHECKTRAJECTORYWAYPOINTCONSISTENCY Confirm the curved trajectory hits every control point.
+    sampledENU = zeros(size(model.waypointENU));
+    for k = 1:numel(model.time)
+        sampledENU(k,:) = sampleCurvedTrajectory(model, model.time(k));
+    end
+
+    positionError = sampledENU - model.waypointENU;
+    errorNorm = vecnorm(positionError, 2, 2);
+    consistencyReport = table(model.time(:), errorNorm(:), ...
+        'VariableNames', {'time_s','curved_waypoint_error_m'});
+    maxError = max(errorNorm);
+    fprintf('Max curved trajectory waypoint consistency error: %.6g m\n', maxError);
+    if maxError > 1e-6
+        warning('Curved trajectory does not pass exactly through every predefined waypoint.');
+    end
+end
+
+function landmarksENU = generatePredefinedLandmarks(model)
+%GENERATEPREDEFINEDLANDMARKS Place deterministic 3-D landmarks around the route.
+    sampleTimes = linspace(model.time(1), model.time(end), 14);
+    lateralOffsets = [-70; 70];
+    verticalOffsets = [18; -12];
+    landmarksENU = zeros(numel(sampleTimes) * numel(lateralOffsets), 3);
+    landmarkIndex = 1;
+
+    for k = 1:numel(sampleTimes)
+        [positionENU, velocityENU] = sampleCurvedTrajectory(model, sampleTimes(k));
+        horizontalVelocity = velocityENU(1:2);
+        if norm(horizontalVelocity) < 1e-6
+            side = [0, 1, 0];
+        else
+            side2D = [-horizontalVelocity(2), horizontalVelocity(1)] ./ norm(horizontalVelocity);
+            side = [side2D, 0];
+        end
+
+        for j = 1:numel(lateralOffsets)
+            alongOffset = 18 .* sin(0.7 .* k + j);
+            forward = [velocityENU(1:2), 0];
+            if norm(forward) > 1e-6
+                forward = forward ./ norm(forward);
+            end
+            landmarksENU(landmarkIndex,:) = positionENU + lateralOffsets(j) .* side + ...
+                alongOffset .* forward + [0, 0, verticalOffsets(j)];
+            landmarkIndex = landmarkIndex + 1;
+        end
+    end
+end
+
+function accelerationENU = accelerationMeasurementToENU(accelerationBody, attitude, imuParams)
+%ACCELERATIONMEASUREMENTTOENU Rotate body acceleration to ENU and restore gravity if needed.
+    accelerationENU = attitude * accelerationBody.';
+    if imuParams.accelerometerIncludesGravity
+        accelerationENU = accelerationENU + imuParams.gravityENU.';
+    end
+    accelerationENU = accelerationENU.';
+end
+
+function [lioState, lioCovariance] = propagateLioState(lioState, lioCovariance, accelerationENU, dt, lioParams)
+%PROPAGATELIOSTATE EKF prediction using the same IMU acceleration as pure DR.
+    stateTransition = [eye(3), dt .* eye(3); zeros(3), eye(3)];
+    controlMatrix = [0.5 .* dt.^2 .* eye(3); dt .* eye(3)];
+
+    lioState = stateTransition * lioState + controlMatrix * accelerationENU.';
+    processNoise = (lioParams.accelProcessNoiseStd.^2) .* (controlMatrix * controlMatrix.');
+    lioCovariance = stateTransition * lioCovariance * stateTransition.' + processNoise;
+end
+
+function [matchedPositionENU, matchedCount] = scanMatchLidarPosition(referencePosition, referenceAttitude, estimatedAttitude, landmarksENU, lioParams)
+%SCANMATCHLIDARPOSITION Estimate position by matching visible landmarks to the known map.
+    landmarkDelta = landmarksENU - referencePosition;
+    ranges = vecnorm(landmarkDelta, 2, 2);
+    visibleLandmarks = find(ranges <= lioParams.lidarRange);
+    matchedCount = numel(visibleLandmarks);
+
+    if matchedCount == 0
+        matchedPositionENU = [NaN, NaN, NaN];
+        return;
+    end
+
+    positionCandidates = zeros(matchedCount, 3);
+    for k = 1:matchedCount
+        landmarkIndex = visibleLandmarks(k);
+        trueBodyPoint = referenceAttitude.' * (landmarksENU(landmarkIndex,:) - referencePosition).';
+        measuredBodyPoint = trueBodyPoint.' + lioParams.lidarNoiseStd .* randn(1, 3);
+        positionCandidates(k,:) = landmarksENU(landmarkIndex,:) - (estimatedAttitude * measuredBodyPoint.').';
+    end
+
+    matchedPositionENU = mean(positionCandidates, 1);
+end
+
+function [lioState, lioCovariance] = updateLioWithScanMatch(lioState, lioCovariance, lidarPositionENU, matchedCount, lioParams)
+%UPDATELIOWITHSCANMATCH EKF position update from landmark scan matching.
+    observationMatrix = [eye(3), zeros(3)];
+    measurementNoise = (lioParams.lidarNoiseStd.^2 ./ matchedCount) .* eye(3);
+    innovation = lidarPositionENU.' - observationMatrix * lioState;
+    innovationCovariance = observationMatrix * lioCovariance * observationMatrix.' + measurementNoise;
+    kalmanGain = lioCovariance * observationMatrix.' / innovationCovariance;
+
+    lioState = lioState + kalmanGain * innovation;
+    lioCovariance = (eye(6) - kalmanGain * observationMatrix) * lioCovariance;
+end
+
+function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTime, imuParams, lioParams, landmarksENU, origin)
+%FLYIMUDEADRECKONINGLOOP Propagate pure IMU and LIO EKF states from IMU/lidar.
     startTime = model.time(1);
     endTime = model.time(end);
     maxSamples = ceil((endTime - startTime) / sampleTime) + 2;
@@ -211,6 +355,10 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
     deadReckonedENU = zeros(maxSamples, 3);
     deadReckonedVelocityENU = zeros(maxSamples, 3);
     deadReckonedEuler = zeros(maxSamples, 3);
+    lioENU = zeros(maxSamples, 3);
+    lioVelocityENU = zeros(maxSamples, 3);
+    lioPositionStdENU = zeros(maxSamples, 3);
+    lidarMatchedLandmarkCount = zeros(maxSamples, 1);
 
     sampleIndex = 1;
     currentTime = startTime;
@@ -222,12 +370,18 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
     deadReckonedVelocity = referenceVelocity;
     deadReckonedAttitude = referenceAttitude;
 
+    lioState = [referencePosition, referenceVelocity].';
+    lioCovariance = diag([repmat(lioParams.initialPositionStd.^2, 1, 3), ...
+        repmat(lioParams.initialVelocityStd.^2, 1, 3)]);
+
     [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, ...
-        measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler] = ...
+        measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler, ...
+        lioENU, lioVelocityENU, lioPositionStdENU, lidarMatchedLandmarkCount] = ...
         logFlightSample(sampleIndex, currentTime, referencePosition, referenceVelocity, referenceAcceleration, ...
-        imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, time, referenceENU, ...
-        referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, measuredAccelerationBody, ...
-        deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler);
+        imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, lioState, ...
+        lioCovariance, 0, time, referenceENU, referenceVelocityENU, referenceAccelerationENU, ...
+        measuredAngularVelocityBody, measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, ...
+        deadReckonedEuler, lioENU, lioVelocityENU, lioPositionStdENU, lidarMatchedLandmarkCount);
 
     while currentTime < endTime
         nextTime = min(currentTime + sampleTime, endTime);
@@ -242,17 +396,19 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
             pause(dt);
         end
 
-        % Strapdown IMU propagation.  The interval gyro measurement integrates
-        % attitude.  The accelerometer channel is rotated into ENU; gravity is
-        % only restored when modeling a raw specific-force accelerometer.
         deadReckonedAttitude = deadReckonedAttitude * rotationExp(intervalImuMeasurement.angularVelocityBody .* dt);
-        estimatedAcceleration = deadReckonedAttitude * intervalImuMeasurement.accelerationBody.';
-        if imuParams.accelerometerIncludesGravity
-            estimatedAcceleration = estimatedAcceleration + imuParams.gravityENU.';
-        end
-        estimatedAcceleration = estimatedAcceleration.';
+        estimatedAcceleration = accelerationMeasurementToENU(intervalImuMeasurement.accelerationBody, ...
+            deadReckonedAttitude, imuParams);
         deadReckonedPosition = deadReckonedPosition + deadReckonedVelocity .* dt + 0.5 .* estimatedAcceleration .* dt.^2;
         deadReckonedVelocity = deadReckonedVelocity + estimatedAcceleration .* dt;
+
+        [lioState, lioCovariance] = propagateLioState(lioState, lioCovariance, estimatedAcceleration, dt, lioParams);
+        [lidarPositionENU, matchedCount] = scanMatchLidarPosition(nextReferencePosition, nextReferenceAttitude, ...
+            deadReckonedAttitude, landmarksENU, lioParams);
+        if matchedCount >= lioParams.minLandmarksForUpdate
+            [lioState, lioCovariance] = updateLioWithScanMatch(lioState, lioCovariance, lidarPositionENU, ...
+                matchedCount, lioParams);
+        end
 
         currentTime = nextTime;
         referencePosition = nextReferencePosition;
@@ -263,11 +419,13 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
 
         sampleIndex = sampleIndex + 1;
         [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, ...
-            measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler] = ...
+            measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler, ...
+            lioENU, lioVelocityENU, lioPositionStdENU, lidarMatchedLandmarkCount] = ...
             logFlightSample(sampleIndex, currentTime, referencePosition, referenceVelocity, referenceAcceleration, ...
-            imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, time, referenceENU, ...
-            referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, measuredAccelerationBody, ...
-            deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler);
+            imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, lioState, ...
+            lioCovariance, matchedCount, time, referenceENU, referenceVelocityENU, referenceAccelerationENU, ...
+            measuredAngularVelocityBody, measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, ...
+            deadReckonedEuler, lioENU, lioVelocityENU, lioPositionStdENU, lidarMatchedLandmarkCount);
     end
 
     time = time(1:sampleIndex);
@@ -279,8 +437,13 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
     deadReckonedENU = deadReckonedENU(1:sampleIndex,:);
     deadReckonedVelocityENU = deadReckonedVelocityENU(1:sampleIndex,:);
     deadReckonedEuler = deadReckonedEuler(1:sampleIndex,:);
+    lioENU = lioENU(1:sampleIndex,:);
+    lioVelocityENU = lioVelocityENU(1:sampleIndex,:);
+    lioPositionStdENU = lioPositionStdENU(1:sampleIndex,:);
+    lidarMatchedLandmarkCount = lidarMatchedLandmarkCount(1:sampleIndex);
 
     [latitude, longitude, altitude] = enuToGeodetic(deadReckonedENU, origin);
+    [lioLatitude, lioLongitude, lioAltitude] = enuToGeodetic(lioENU, origin);
     [referenceLatitude, referenceLongitude, referenceAltitude] = enuToGeodetic(referenceENU, origin);
 
     flightLog.time = time;
@@ -292,21 +455,30 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
     flightLog.deadReckonedENU = deadReckonedENU;
     flightLog.deadReckonedVelocityENU = deadReckonedVelocityENU;
     flightLog.deadReckonedEuler = deadReckonedEuler;
+    flightLog.lioENU = lioENU;
+    flightLog.lioVelocityENU = lioVelocityENU;
+    flightLog.lioPositionStdENU = lioPositionStdENU;
+    flightLog.lidarMatchedLandmarkCount = lidarMatchedLandmarkCount;
     flightLog.latitude = latitude;
     flightLog.longitude = longitude;
     flightLog.altitude = altitude;
+    flightLog.lioLatitude = lioLatitude;
+    flightLog.lioLongitude = lioLongitude;
+    flightLog.lioAltitude = lioAltitude;
     flightLog.referenceLatitude = referenceLatitude;
     flightLog.referenceLongitude = referenceLongitude;
     flightLog.referenceAltitude = referenceAltitude;
 end
 
 function [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, ...
-    measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler] = ...
+    measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler, ...
+    lioENU, lioVelocityENU, lioPositionStdENU, lidarMatchedLandmarkCount] = ...
     logFlightSample(sampleIndex, currentTime, referencePosition, referenceVelocity, referenceAcceleration, ...
-    imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, time, referenceENU, ...
-    referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, measuredAccelerationBody, ...
-    deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler)
-%LOGFLIGHTSAMPLE Store one reference, IMU, and propagated dead-reckoning state.
+    imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, lioState, ...
+    lioCovariance, matchedCount, time, referenceENU, referenceVelocityENU, referenceAccelerationENU, ...
+    measuredAngularVelocityBody, measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, ...
+    deadReckonedEuler, lioENU, lioVelocityENU, lioPositionStdENU, lidarMatchedLandmarkCount)
+%LOGFLIGHTSAMPLE Store one reference, IMU, pure-IMU, and LIO state sample.
     time(sampleIndex) = currentTime;
     referenceENU(sampleIndex,:) = referencePosition;
     referenceVelocityENU(sampleIndex,:) = referenceVelocity;
@@ -316,6 +488,10 @@ function [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, me
     deadReckonedENU(sampleIndex,:) = deadReckonedPosition;
     deadReckonedVelocityENU(sampleIndex,:) = deadReckonedVelocity;
     deadReckonedEuler(sampleIndex,:) = attitudeToEulerZYX(deadReckonedAttitude);
+    lioENU(sampleIndex,:) = lioState(1:3).';
+    lioVelocityENU(sampleIndex,:) = lioState(4:6).';
+    lioPositionStdENU(sampleIndex,:) = sqrt(diag(lioCovariance(1:3,1:3))).';
+    lidarMatchedLandmarkCount(sampleIndex) = matchedCount;
 end
 
 function [positionENU, velocityENU, accelerationENU] = sampleCurvedTrajectory(model, queryTime)

@@ -1,6 +1,6 @@
 # dead-reckoning
 
-This repository contains a MATLAB example of curved, time-stepped 3-D IMU dead reckoning for a UAV.
+This repository contains a MATLAB example of curved, time-stepped 3-D IMU and lidar-inertial odometry (LIO) dead reckoning for a UAV.
 
 ## What the script does
 
@@ -9,9 +9,12 @@ This repository contains a MATLAB example of curved, time-stepped 3-D IMU dead r
 - input trajectory control-point columns are `[time_s, latitude_deg, longitude_deg, altitude_m]`;
 - latitude, longitude, and altitude are converted into a local ENU (`east`, `north`, `up`) frame;
 - timed control points are connected with a cubic Hermite curve, so the UAV follows a smooth trajectory rather than straight line segments;
+- the script checks that the curved trajectory evaluates exactly at the predefined timed waypoints;
 - the simulated flight advances one `sampleTime` at a time in `flyImuDeadReckoningLoop`, instead of generating and integrating the whole route in one vectorized step;
 - the reference trajectory supplies position, velocity, and acceleration for a simple IMU sensor model;
 - gyroscope measurements propagate body-to-ENU attitude, and gravity-compensated body-frame accelerometer measurements propagate velocity and position;
+- predefined 3-D landmarks are generated around the trajectory and used for lidar scan matching;
+- a lidar-inertial EKF fuses the scan-matched landmark position with the IMU propagation for comparison against pure IMU dead reckoning;
 - the UAV flight is replayed as a 3-D animation that advances according to the trajectory timestamps;
 - results are converted back to latitude, longitude, and altitude for display and map plotting.
 
@@ -37,9 +40,29 @@ imuParams.accelNoiseStd = 0.005;
 imuParams.accelerometerIncludesGravity = false;
 ```
 
+
+## Lidar-inertial odometry comparison
+
+The script generates deterministic 3-D landmarks around the reference route with `generatePredefinedLandmarks`.  During each sample, `scanMatchLidarPosition` simulates a lidar scan by observing visible landmarks in the body frame, matches those observations back to the known landmark map, and estimates a scan-matched ENU position.
+
+`propagateLioState` predicts a 6-state EKF `[east, north, up, v_e, v_n, v_u]` with the same IMU acceleration used by pure dead reckoning.  When enough landmark correspondences are visible, `updateLioWithScanMatch` applies a position measurement update, so the plots compare:
+
+- the curved reference trajectory;
+- pure IMU propagation;
+- lidar-inertial odometry (LIO) EKF fusion.
+
+Tune the LIO defaults near the top of `dead_reckoning.m`:
+
+```matlab
+lioParams.lidarRange = 180;
+lioParams.lidarNoiseStd = 0.35;
+lioParams.minLandmarksForUpdate = 3;
+lioParams.accelProcessNoiseStd = 0.08;
+```
+
 ## Animation and real-time playback
 
-After the dead-reckoning loop, the script opens an animated 3-D flight window.  The reference UAV marker and IMU dead-reckoned estimate move along the trajectory sample by sample, while animated trails show where each has already flown.
+After the dead-reckoning loop, the script opens an animated 3-D flight window.  The reference UAV marker, pure IMU estimate, LIO EKF estimate, and predefined landmarks are shown sample by sample, while animated trails show where each estimate has already flown.
 
 The animation uses `animationSpeedup` to control playback speed:
 
@@ -64,9 +87,9 @@ Open MATLAB in this directory and run:
 dead_reckoning
 ```
 
-The script prints the first time-stamped IMU dead-reckoned samples and opens:
+The script prints the waypoint consistency check, the first time-stamped IMU/LIO dead-reckoned samples, and a final pure-IMU-vs-LIO error comparison, then opens:
 
 1. an animated 3-D local ENU view of the UAV flying over time;
-2. optional static summary plots comparing the curved reference trajectory with the IMU dead-reckoned trajectory;
+2. optional static summary plots comparing the curved reference trajectory with pure IMU and LIO EKF trajectories;
 3. a geographic map view where sample colour represents altitude;
 4. an IMU measurement plot showing gyroscope angular velocity and body-frame accelerometer output.
