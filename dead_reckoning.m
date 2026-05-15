@@ -133,6 +133,16 @@ if showStaticPlots
     title('Curved UAV IMU Dead-Reckoning Samples');
     legend('Location', 'best');
 
+    figure('Name', 'Reference Tracking Error Over Time');
+    plot(flightLog.time, pureImuError, 'LineWidth', 1.5, 'DisplayName', 'Pure IMU dead reckoning error');
+    hold on;
+    plot(flightLog.time, lioError, 'LineWidth', 1.5, 'DisplayName', 'LIO EKF error');
+    grid on;
+    xlabel('Time (s)');
+    ylabel('3-D position error vs reference (m)');
+    title('Reference Trajectory Tracking Error');
+    legend('Location', 'best');
+
     figure('Name', 'IMU Measurements');
     tiledlayout(2,1);
     nexttile;

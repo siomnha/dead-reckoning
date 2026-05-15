@@ -93,4 +93,5 @@ The script prints the waypoint consistency check, the first time-stamped IMU/LIO
 1. an animated 3-D local ENU view of the UAV flying over time;
 2. optional static summary plots comparing the curved reference trajectory with pure IMU and LIO EKF trajectories;
 3. a geographic map view where sample colour represents altitude;
-4. an IMU measurement plot showing gyroscope angular velocity and body-frame accelerometer output.
+4. a time-history plot comparing pure IMU and LIO 3-D position error against the reference trajectory;
+5. an IMU measurement plot showing gyroscope angular velocity and body-frame accelerometer output.
