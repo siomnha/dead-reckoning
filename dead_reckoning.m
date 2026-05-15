@@ -38,13 +38,15 @@ imuParams.accelerometerIncludesGravity = false;               % false avoids raw
 
 % Lidar-inertial odometry (LIO) scan-matching settings.  Landmarks are known
 % 3-D map points around the route; each scan observes nearby landmarks in the
-% body frame and the EKF fuses the scan-matched position with IMU propagation.
+% body frame and the EKF fuses landmark residuals with IMU propagation.
 lioParams.lidarRange = 180;                 % m
 lioParams.lidarNoiseStd = 0.35;             % m, per landmark body-frame point noise
 lioParams.minLandmarksForUpdate = 3;        % minimum correspondences for scan matching
 lioParams.initialPositionStd = 1.0;         % m
 lioParams.initialVelocityStd = 0.5;         % m/s
+lioParams.initialAttitudeStd = deg2rad(2);  % rad, small-angle attitude uncertainty
 lioParams.accelProcessNoiseStd = 0.08;      % m/s^2
+lioParams.gyroProcessNoiseStd = deg2rad(0.01); % rad/s
 rng(7);                                    % repeatable noise for the demo
 
 %% Create the curved trajectory model, landmarks, and fly one IMU sample at a time
@@ -76,11 +78,14 @@ results = table( ...
     flightLog.lioENU(:,1), ...
     flightLog.lioENU(:,2), ...
     flightLog.lioENU(:,3), ...
+    flightLog.lioEuler(:,1), ...
+    flightLog.lioEuler(:,2), ...
+    flightLog.lioEuler(:,3), ...
     flightLog.lidarMatchedLandmarkCount(:), ...
     'VariableNames', {'time_s','latitude_deg','longitude_deg','altitude_m', ...
     'east_m','north_m','up_m','ve_mps','vn_mps','vu_mps', ...
     'gyro_p_radps','gyro_q_radps','gyro_r_radps','accel_x_mps2','accel_y_mps2','accel_z_mps2', ...
-    'lio_east_m','lio_north_m','lio_up_m','matched_landmarks'});
+    'lio_east_m','lio_north_m','lio_up_m','lio_yaw_rad','lio_pitch_rad','lio_roll_rad','matched_landmarks'});
 disp(results(1:min(10,height(results)),:));
 
 pureImuError = vecnorm(flightLog.deadReckonedENU - flightLog.referenceENU, 2, 2);
@@ -295,49 +300,62 @@ function accelerationENU = accelerationMeasurementToENU(accelerationBody, attitu
     accelerationENU = accelerationENU.';
 end
 
-function [lioState, lioCovariance] = propagateLioState(lioState, lioCovariance, accelerationENU, dt, lioParams)
-%PROPAGATELIOSTATE EKF prediction using the same IMU acceleration as pure DR.
-    stateTransition = [eye(3), dt .* eye(3); zeros(3), eye(3)];
-    controlMatrix = [0.5 .* dt.^2 .* eye(3); dt .* eye(3)];
+function [lioState, lioAttitude, lioCovariance] = propagateLioState(lioState, lioAttitude, lioCovariance, imuMeasurement, dt, imuParams, lioParams)
+%PROPAGATELIOSTATE EKF prediction for position, velocity, and attitude error.
+    lioAttitude = lioAttitude * rotationExp(imuMeasurement.angularVelocityBody .* dt);
+    accelerationENU = accelerationMeasurementToENU(imuMeasurement.accelerationBody, lioAttitude, imuParams);
 
-    lioState = stateTransition * lioState + controlMatrix * accelerationENU.';
-    processNoise = (lioParams.accelProcessNoiseStd.^2) .* (controlMatrix * controlMatrix.');
+    lioState(1:3) = lioState(1:3) + lioState(4:6) .* dt + 0.5 .* accelerationENU.' .* dt.^2;
+    lioState(4:6) = lioState(4:6) + accelerationENU.' .* dt;
+
+    stateTransition = eye(9);
+    stateTransition(1:3,4:6) = dt .* eye(3);
+    stateTransition(4:6,7:9) = -lioAttitude * skewSymmetric(imuMeasurement.accelerationBody) .* dt;
+
+    accelControl = [0.5 .* dt.^2 .* eye(3); dt .* eye(3); zeros(3)];
+    gyroControl = [zeros(6,3); dt .* eye(3)];
+    processNoise = (lioParams.accelProcessNoiseStd.^2) .* (accelControl * accelControl.') + ...
+        (lioParams.gyroProcessNoiseStd.^2) .* (gyroControl * gyroControl.');
     lioCovariance = stateTransition * lioCovariance * stateTransition.' + processNoise;
 end
 
-function [matchedPositionENU, matchedCount] = scanMatchLidarPosition(referencePosition, referenceAttitude, estimatedAttitude, landmarksENU, lioParams)
-%SCANMATCHLIDARPOSITION Estimate position by matching visible landmarks to the known map.
+function [lioState, lioAttitude, lioCovariance, matchedCount] = updateLioWithLandmarkResiduals( ...
+    lioState, lioAttitude, lioCovariance, referencePosition, referenceAttitude, landmarksENU, lioParams)
+%UPDATELIOWITHLANDMARKRESIDUALS EKF update from raw landmark residuals.
     landmarkDelta = landmarksENU - referencePosition;
     ranges = vecnorm(landmarkDelta, 2, 2);
     visibleLandmarks = find(ranges <= lioParams.lidarRange);
     matchedCount = numel(visibleLandmarks);
 
-    if matchedCount == 0
-        matchedPositionENU = [NaN, NaN, NaN];
+    if matchedCount < lioParams.minLandmarksForUpdate
         return;
     end
 
-    positionCandidates = zeros(matchedCount, 3);
     for k = 1:matchedCount
-        landmarkIndex = visibleLandmarks(k);
-        trueBodyPoint = referenceAttitude.' * (landmarksENU(landmarkIndex,:) - referencePosition).';
-        measuredBodyPoint = trueBodyPoint.' + lioParams.lidarNoiseStd .* randn(1, 3);
-        positionCandidates(k,:) = landmarksENU(landmarkIndex,:) - (estimatedAttitude * measuredBodyPoint.').';
+        landmark = landmarksENU(visibleLandmarks(k),:).';
+
+        % Simulated lidar point in the body frame.  The measurement is generated
+        % from the true/reference pose, but the EKF update below uses only the
+        % residual between that point and the current landmark prediction.
+        measuredBodyPoint = referenceAttitude.' * (landmark - referencePosition.') + ...
+            lioParams.lidarNoiseStd .* randn(3, 1);
+
+        predictedBodyPoint = lioAttitude.' * (landmark - lioState(1:3));
+        residual = measuredBodyPoint - predictedBodyPoint;
+
+        observationMatrix = zeros(3, 9);
+        observationMatrix(:,1:3) = -lioAttitude.';
+        observationMatrix(:,7:9) = skewSymmetric(predictedBodyPoint);
+
+        measurementNoise = (lioParams.lidarNoiseStd.^2) .* eye(3);
+        innovationCovariance = observationMatrix * lioCovariance * observationMatrix.' + measurementNoise;
+        kalmanGain = lioCovariance * observationMatrix.' / innovationCovariance;
+        correction = kalmanGain * residual;
+
+        lioState(1:6) = lioState(1:6) + correction(1:6);
+        lioAttitude = lioAttitude * rotationExp(correction(7:9).');
+        lioCovariance = (eye(9) - kalmanGain * observationMatrix) * lioCovariance;
     end
-
-    matchedPositionENU = mean(positionCandidates, 1);
-end
-
-function [lioState, lioCovariance] = updateLioWithScanMatch(lioState, lioCovariance, lidarPositionENU, matchedCount, lioParams)
-%UPDATELIOWITHSCANMATCH EKF position update from landmark scan matching.
-    observationMatrix = [eye(3), zeros(3)];
-    measurementNoise = (lioParams.lidarNoiseStd.^2 ./ matchedCount) .* eye(3);
-    innovation = lidarPositionENU.' - observationMatrix * lioState;
-    innovationCovariance = observationMatrix * lioCovariance * observationMatrix.' + measurementNoise;
-    kalmanGain = lioCovariance * observationMatrix.' / innovationCovariance;
-
-    lioState = lioState + kalmanGain * innovation;
-    lioCovariance = (eye(6) - kalmanGain * observationMatrix) * lioCovariance;
 end
 
 function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTime, imuParams, lioParams, landmarksENU, origin)
@@ -357,6 +375,7 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
     deadReckonedEuler = zeros(maxSamples, 3);
     lioENU = zeros(maxSamples, 3);
     lioVelocityENU = zeros(maxSamples, 3);
+    lioEuler = zeros(maxSamples, 3);
     lioPositionStdENU = zeros(maxSamples, 3);
     lidarMatchedLandmarkCount = zeros(maxSamples, 1);
 
@@ -371,17 +390,19 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
     deadReckonedAttitude = referenceAttitude;
 
     lioState = [referencePosition, referenceVelocity].';
+    lioAttitude = referenceAttitude;
     lioCovariance = diag([repmat(lioParams.initialPositionStd.^2, 1, 3), ...
-        repmat(lioParams.initialVelocityStd.^2, 1, 3)]);
+        repmat(lioParams.initialVelocityStd.^2, 1, 3), ...
+        repmat(lioParams.initialAttitudeStd.^2, 1, 3)]);
 
     [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, ...
         measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler, ...
-        lioENU, lioVelocityENU, lioPositionStdENU, lidarMatchedLandmarkCount] = ...
+        lioENU, lioVelocityENU, lioEuler, lioPositionStdENU, lidarMatchedLandmarkCount] = ...
         logFlightSample(sampleIndex, currentTime, referencePosition, referenceVelocity, referenceAcceleration, ...
-        imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, lioState, ...
+        imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, lioState, lioAttitude, ...
         lioCovariance, 0, time, referenceENU, referenceVelocityENU, referenceAccelerationENU, ...
         measuredAngularVelocityBody, measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, ...
-        deadReckonedEuler, lioENU, lioVelocityENU, lioPositionStdENU, lidarMatchedLandmarkCount);
+        deadReckonedEuler, lioENU, lioVelocityENU, lioEuler, lioPositionStdENU, lidarMatchedLandmarkCount);
 
     while currentTime < endTime
         nextTime = min(currentTime + sampleTime, endTime);
@@ -402,13 +423,10 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
         deadReckonedPosition = deadReckonedPosition + deadReckonedVelocity .* dt + 0.5 .* estimatedAcceleration .* dt.^2;
         deadReckonedVelocity = deadReckonedVelocity + estimatedAcceleration .* dt;
 
-        [lioState, lioCovariance] = propagateLioState(lioState, lioCovariance, estimatedAcceleration, dt, lioParams);
-        [lidarPositionENU, matchedCount] = scanMatchLidarPosition(nextReferencePosition, nextReferenceAttitude, ...
-            deadReckonedAttitude, landmarksENU, lioParams);
-        if matchedCount >= lioParams.minLandmarksForUpdate
-            [lioState, lioCovariance] = updateLioWithScanMatch(lioState, lioCovariance, lidarPositionENU, ...
-                matchedCount, lioParams);
-        end
+        [lioState, lioAttitude, lioCovariance] = propagateLioState(lioState, lioAttitude, lioCovariance, ...
+            intervalImuMeasurement, dt, imuParams, lioParams);
+        [lioState, lioAttitude, lioCovariance, matchedCount] = updateLioWithLandmarkResiduals( ...
+            lioState, lioAttitude, lioCovariance, nextReferencePosition, nextReferenceAttitude, landmarksENU, lioParams);
 
         currentTime = nextTime;
         referencePosition = nextReferencePosition;
@@ -420,12 +438,12 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
         sampleIndex = sampleIndex + 1;
         [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, ...
             measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler, ...
-            lioENU, lioVelocityENU, lioPositionStdENU, lidarMatchedLandmarkCount] = ...
+            lioENU, lioVelocityENU, lioEuler, lioPositionStdENU, lidarMatchedLandmarkCount] = ...
             logFlightSample(sampleIndex, currentTime, referencePosition, referenceVelocity, referenceAcceleration, ...
-            imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, lioState, ...
+            imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, lioState, lioAttitude, ...
             lioCovariance, matchedCount, time, referenceENU, referenceVelocityENU, referenceAccelerationENU, ...
             measuredAngularVelocityBody, measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, ...
-            deadReckonedEuler, lioENU, lioVelocityENU, lioPositionStdENU, lidarMatchedLandmarkCount);
+            deadReckonedEuler, lioENU, lioVelocityENU, lioEuler, lioPositionStdENU, lidarMatchedLandmarkCount);
     end
 
     time = time(1:sampleIndex);
@@ -439,6 +457,7 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
     deadReckonedEuler = deadReckonedEuler(1:sampleIndex,:);
     lioENU = lioENU(1:sampleIndex,:);
     lioVelocityENU = lioVelocityENU(1:sampleIndex,:);
+    lioEuler = lioEuler(1:sampleIndex,:);
     lioPositionStdENU = lioPositionStdENU(1:sampleIndex,:);
     lidarMatchedLandmarkCount = lidarMatchedLandmarkCount(1:sampleIndex);
 
@@ -457,6 +476,7 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
     flightLog.deadReckonedEuler = deadReckonedEuler;
     flightLog.lioENU = lioENU;
     flightLog.lioVelocityENU = lioVelocityENU;
+    flightLog.lioEuler = lioEuler;
     flightLog.lioPositionStdENU = lioPositionStdENU;
     flightLog.lidarMatchedLandmarkCount = lidarMatchedLandmarkCount;
     flightLog.latitude = latitude;
@@ -472,12 +492,12 @@ end
 
 function [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, ...
     measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler, ...
-    lioENU, lioVelocityENU, lioPositionStdENU, lidarMatchedLandmarkCount] = ...
+    lioENU, lioVelocityENU, lioEuler, lioPositionStdENU, lidarMatchedLandmarkCount] = ...
     logFlightSample(sampleIndex, currentTime, referencePosition, referenceVelocity, referenceAcceleration, ...
-    imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, lioState, ...
+    imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, lioState, lioAttitude, ...
     lioCovariance, matchedCount, time, referenceENU, referenceVelocityENU, referenceAccelerationENU, ...
     measuredAngularVelocityBody, measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, ...
-    deadReckonedEuler, lioENU, lioVelocityENU, lioPositionStdENU, lidarMatchedLandmarkCount)
+    deadReckonedEuler, lioENU, lioVelocityENU, lioEuler, lioPositionStdENU, lidarMatchedLandmarkCount)
 %LOGFLIGHTSAMPLE Store one reference, IMU, pure-IMU, and LIO state sample.
     time(sampleIndex) = currentTime;
     referenceENU(sampleIndex,:) = referencePosition;
@@ -490,6 +510,7 @@ function [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, me
     deadReckonedEuler(sampleIndex,:) = attitudeToEulerZYX(deadReckonedAttitude);
     lioENU(sampleIndex,:) = lioState(1:3).';
     lioVelocityENU(sampleIndex,:) = lioState(4:6).';
+    lioEuler(sampleIndex,:) = attitudeToEulerZYX(lioAttitude);
     lioPositionStdENU(sampleIndex,:) = sqrt(diag(lioCovariance(1:3,1:3))).';
     lidarMatchedLandmarkCount(sampleIndex) = matchedCount;
 end

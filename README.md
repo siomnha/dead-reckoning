@@ -14,7 +14,7 @@ This repository contains a MATLAB example of curved, time-stepped 3-D IMU and li
 - the reference trajectory supplies position, velocity, and acceleration for a simple IMU sensor model;
 - gyroscope measurements propagate body-to-ENU attitude, and gravity-compensated body-frame accelerometer measurements propagate velocity and position;
 - predefined 3-D landmarks are generated around the trajectory and used for lidar scan matching;
-- a lidar-inertial EKF fuses the scan-matched landmark position with the IMU propagation for comparison against pure IMU dead reckoning;
+- a lidar-inertial EKF keeps position, velocity, and attitude in the state and fuses landmark residuals directly with IMU propagation for comparison against pure IMU dead reckoning;
 - the UAV flight is replayed as a 3-D animation that advances according to the trajectory timestamps;
 - results are converted back to latitude, longitude, and altitude for display and map plotting.
 
@@ -43,9 +43,9 @@ imuParams.accelerometerIncludesGravity = false;
 
 ## Lidar-inertial odometry comparison
 
-The script generates deterministic 3-D landmarks around the reference route with `generatePredefinedLandmarks`.  During each sample, `scanMatchLidarPosition` simulates a lidar scan by observing visible landmarks in the body frame, matches those observations back to the known landmark map, and estimates a scan-matched ENU position.
+The script generates deterministic 3-D landmarks around the reference route with `generatePredefinedLandmarks`.  During each sample, `updateLioWithLandmarkResiduals` simulates a lidar scan by observing visible landmarks in the body frame and updates the EKF with each landmark residual directly, instead of first converting the scan to a matched position.
 
-`propagateLioState` predicts a 6-state EKF `[east, north, up, v_e, v_n, v_u]` with the same IMU acceleration used by pure dead reckoning.  When enough landmark correspondences are visible, `updateLioWithScanMatch` applies a position measurement update, so the plots compare:
+`propagateLioState` predicts a 9-state error-state EKF `[east, north, up, v_e, v_n, v_u, attitude_error]` with IMU gyro and accelerometer measurements.  When enough landmark correspondences are visible, `updateLioWithLandmarkResiduals` applies raw landmark residual updates that correct both position/velocity and attitude, so the plots compare:
 
 - the curved reference trajectory;
 - pure IMU propagation;
@@ -58,6 +58,7 @@ lioParams.lidarRange = 180;
 lioParams.lidarNoiseStd = 0.35;
 lioParams.minLandmarksForUpdate = 3;
 lioParams.accelProcessNoiseStd = 0.08;
+lioParams.gyroProcessNoiseStd = deg2rad(0.01);
 ```
 
 ## Animation and real-time playback
