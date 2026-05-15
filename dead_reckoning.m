@@ -2,8 +2,8 @@
 % This example replaces 2-D straight waypoint segments with a timestamped 3-D
 % UAV trajectory.  The route between timed waypoints is a smooth cubic Hermite
 % curve.  At each sampling interval the UAV now propagates with IMU data:
-% gyroscope angular velocity updates attitude, and accelerometer specific force
-% updates velocity and position.
+% gyroscope angular velocity updates attitude, and body-frame accelerometer measurements
+% update velocity and position.
 
 clear; clc;
 
@@ -25,13 +25,16 @@ animationSpeedup = 12;       % 1 = real time, 12 = play the 245 s route in about
 showStaticPlots = true;      % keep summary plots after the animated flight
 
 % Simple IMU sensor model.  Gyroscope measurements are body-frame angular
-% velocity [rad/s].  Accelerometer measurements are body-frame specific force
-% [m/s^2], so gravity is added back during navigation-frame propagation.
-imuParams.gyroBiasBody = deg2rad([0.01, -0.015, 0.02]);       % [p q r] rad/s
-imuParams.gyroNoiseStd = deg2rad(0.02);                       % rad/s
-imuParams.accelBiasBody = [0.015, -0.010, 0.020];             % [fx fy fz] m/s^2
-imuParams.accelNoiseStd = 0.025;                              % m/s^2
+% velocity [rad/s].  By default the accelerometer channel is treated as a
+% gravity-compensated body-frame linear acceleration, so it does not carry a
+% constant ~9.81 m/s^2 offset.  Set accelerometerIncludesGravity = true to
+% model a raw specific-force accelerometer instead.
+imuParams.gyroBiasBody = deg2rad([0.001, -0.0015, 0.002]);    % [p q r] rad/s
+imuParams.gyroNoiseStd = deg2rad(0.002);                      % rad/s
+imuParams.accelBiasBody = [0.002, -0.0015, 0.003];            % [ax ay az] m/s^2
+imuParams.accelNoiseStd = 0.005;                              % m/s^2
 imuParams.gravityENU = [0, 0, -9.80665];                      % ENU gravity, up-positive
+imuParams.accelerometerIncludesGravity = false;               % false avoids raw 1-g accelerometer offset
 rng(7);                                                       % repeatable noise for the demo
 
 %% Create the curved trajectory model and fly it one IMU sample at a time
@@ -53,12 +56,12 @@ results = table( ...
     flightLog.measuredAngularVelocityBody(:,1), ...
     flightLog.measuredAngularVelocityBody(:,2), ...
     flightLog.measuredAngularVelocityBody(:,3), ...
-    flightLog.measuredSpecificForceBody(:,1), ...
-    flightLog.measuredSpecificForceBody(:,2), ...
-    flightLog.measuredSpecificForceBody(:,3), ...
+    flightLog.measuredAccelerationBody(:,1), ...
+    flightLog.measuredAccelerationBody(:,2), ...
+    flightLog.measuredAccelerationBody(:,3), ...
     'VariableNames', {'time_s','latitude_deg','longitude_deg','altitude_m', ...
     'east_m','north_m','up_m','ve_mps','vn_mps','vu_mps', ...
-    'gyro_p_radps','gyro_q_radps','gyro_r_radps','accel_fx_mps2','accel_fy_mps2','accel_fz_mps2'});
+    'gyro_p_radps','gyro_q_radps','gyro_r_radps','accel_x_mps2','accel_y_mps2','accel_z_mps2'});
 disp(results(1:min(10,height(results)),:));
 
 %% Animate the UAV flying the trajectory over time
@@ -102,11 +105,11 @@ if showStaticPlots
     legend('p','q','r', 'Location', 'best');
     title('Measured Gyroscope Output');
     nexttile;
-    plot(flightLog.time, flightLog.measuredSpecificForceBody, 'LineWidth', 1.2);
+    plot(flightLog.time, flightLog.measuredAccelerationBody, 'LineWidth', 1.2);
     grid on;
     xlabel('Time (s)');
-    ylabel('Specific force (m/s^2)');
-    legend('f_x','f_y','f_z', 'Location', 'best');
+    ylabel('Body acceleration (m/s^2)');
+    legend('a_x','a_y','a_z', 'Location', 'best');
     title('Measured Accelerometer Output');
 end
 
@@ -204,7 +207,7 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
     referenceVelocityENU = zeros(maxSamples, 3);
     referenceAccelerationENU = zeros(maxSamples, 3);
     measuredAngularVelocityBody = zeros(maxSamples, 3);
-    measuredSpecificForceBody = zeros(maxSamples, 3);
+    measuredAccelerationBody = zeros(maxSamples, 3);
     deadReckonedENU = zeros(maxSamples, 3);
     deadReckonedVelocityENU = zeros(maxSamples, 3);
     deadReckonedEuler = zeros(maxSamples, 3);
@@ -220,10 +223,10 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
     deadReckonedAttitude = referenceAttitude;
 
     [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, ...
-        measuredSpecificForceBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler] = ...
+        measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler] = ...
         logFlightSample(sampleIndex, currentTime, referencePosition, referenceVelocity, referenceAcceleration, ...
         imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, time, referenceENU, ...
-        referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, measuredSpecificForceBody, ...
+        referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, measuredAccelerationBody, ...
         deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler);
 
     while currentTime < endTime
@@ -240,10 +243,13 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
         end
 
         % Strapdown IMU propagation.  The interval gyro measurement integrates
-        % attitude; the interval accelerometer specific force is rotated into ENU
-        % and gravity is restored to obtain translational acceleration.
+        % attitude.  The accelerometer channel is rotated into ENU; gravity is
+        % only restored when modeling a raw specific-force accelerometer.
         deadReckonedAttitude = deadReckonedAttitude * rotationExp(intervalImuMeasurement.angularVelocityBody .* dt);
-        estimatedAcceleration = deadReckonedAttitude * intervalImuMeasurement.specificForceBody.' + imuParams.gravityENU.';
+        estimatedAcceleration = deadReckonedAttitude * intervalImuMeasurement.accelerationBody.';
+        if imuParams.accelerometerIncludesGravity
+            estimatedAcceleration = estimatedAcceleration + imuParams.gravityENU.';
+        end
         estimatedAcceleration = estimatedAcceleration.';
         deadReckonedPosition = deadReckonedPosition + deadReckonedVelocity .* dt + 0.5 .* estimatedAcceleration .* dt.^2;
         deadReckonedVelocity = deadReckonedVelocity + estimatedAcceleration .* dt;
@@ -257,10 +263,10 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
 
         sampleIndex = sampleIndex + 1;
         [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, ...
-            measuredSpecificForceBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler] = ...
+            measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler] = ...
             logFlightSample(sampleIndex, currentTime, referencePosition, referenceVelocity, referenceAcceleration, ...
             imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, time, referenceENU, ...
-            referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, measuredSpecificForceBody, ...
+            referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, measuredAccelerationBody, ...
             deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler);
     end
 
@@ -269,7 +275,7 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
     referenceVelocityENU = referenceVelocityENU(1:sampleIndex,:);
     referenceAccelerationENU = referenceAccelerationENU(1:sampleIndex,:);
     measuredAngularVelocityBody = measuredAngularVelocityBody(1:sampleIndex,:);
-    measuredSpecificForceBody = measuredSpecificForceBody(1:sampleIndex,:);
+    measuredAccelerationBody = measuredAccelerationBody(1:sampleIndex,:);
     deadReckonedENU = deadReckonedENU(1:sampleIndex,:);
     deadReckonedVelocityENU = deadReckonedVelocityENU(1:sampleIndex,:);
     deadReckonedEuler = deadReckonedEuler(1:sampleIndex,:);
@@ -282,7 +288,7 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
     flightLog.referenceVelocityENU = referenceVelocityENU;
     flightLog.referenceAccelerationENU = referenceAccelerationENU;
     flightLog.measuredAngularVelocityBody = measuredAngularVelocityBody;
-    flightLog.measuredSpecificForceBody = measuredSpecificForceBody;
+    flightLog.measuredAccelerationBody = measuredAccelerationBody;
     flightLog.deadReckonedENU = deadReckonedENU;
     flightLog.deadReckonedVelocityENU = deadReckonedVelocityENU;
     flightLog.deadReckonedEuler = deadReckonedEuler;
@@ -295,10 +301,10 @@ function flightLog = flyImuDeadReckoningLoop(model, sampleTime, playbackInRealTi
 end
 
 function [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, ...
-    measuredSpecificForceBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler] = ...
+    measuredAccelerationBody, deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler] = ...
     logFlightSample(sampleIndex, currentTime, referencePosition, referenceVelocity, referenceAcceleration, ...
     imuMeasurement, deadReckonedPosition, deadReckonedVelocity, deadReckonedAttitude, time, referenceENU, ...
-    referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, measuredSpecificForceBody, ...
+    referenceVelocityENU, referenceAccelerationENU, measuredAngularVelocityBody, measuredAccelerationBody, ...
     deadReckonedENU, deadReckonedVelocityENU, deadReckonedEuler)
 %LOGFLIGHTSAMPLE Store one reference, IMU, and propagated dead-reckoning state.
     time(sampleIndex) = currentTime;
@@ -306,7 +312,7 @@ function [time, referenceENU, referenceVelocityENU, referenceAccelerationENU, me
     referenceVelocityENU(sampleIndex,:) = referenceVelocity;
     referenceAccelerationENU(sampleIndex,:) = referenceAcceleration;
     measuredAngularVelocityBody(sampleIndex,:) = imuMeasurement.angularVelocityBody;
-    measuredSpecificForceBody(sampleIndex,:) = imuMeasurement.specificForceBody;
+    measuredAccelerationBody(sampleIndex,:) = imuMeasurement.accelerationBody;
     deadReckonedENU(sampleIndex,:) = deadReckonedPosition;
     deadReckonedVelocityENU(sampleIndex,:) = deadReckonedVelocity;
     deadReckonedEuler(sampleIndex,:) = attitudeToEulerZYX(deadReckonedAttitude);
@@ -381,11 +387,15 @@ function imuMeasurement = makeImuMeasurement(currentAttitude, previousAttitude, 
         trueAngularVelocityBody = rotationLog(previousAttitude.' * currentAttitude) ./ dt;
     end
 
-    trueSpecificForceBody = (currentAttitude.' * (accelerationENU - imuParams.gravityENU).').';
+    if imuParams.accelerometerIncludesGravity
+        trueAccelerationBody = (currentAttitude.' * (accelerationENU - imuParams.gravityENU).').';
+    else
+        trueAccelerationBody = (currentAttitude.' * accelerationENU.').';
+    end
 
     imuMeasurement.angularVelocityBody = trueAngularVelocityBody + imuParams.gyroBiasBody + ...
         imuParams.gyroNoiseStd .* randn(1, 3);
-    imuMeasurement.specificForceBody = trueSpecificForceBody + imuParams.accelBiasBody + ...
+    imuMeasurement.accelerationBody = trueAccelerationBody + imuParams.accelBiasBody + ...
         imuParams.accelNoiseStd .* randn(1, 3);
 end
 
