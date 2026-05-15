@@ -13,6 +13,7 @@ This repository contains a MATLAB example of curved, time-stepped 3-D IMU dead r
 - the reference trajectory supplies position, velocity, and acceleration for a simple IMU sensor model;
 - gyroscope measurements propagate body-to-ENU attitude, and accelerometer specific-force measurements propagate velocity and position;
 - the UAV flight is replayed as a 3-D animation that advances according to the trajectory timestamps;
+- the UAV flight is replayed as a 3-D animation that advances according to the trajectory timestamps;
 - results are converted back to latitude, longitude, and altitude for display and map plotting.
 
 The implementation is self-contained and does not require MATLAB's `dreckon` function.  For short UAV routes it uses a spherical-earth local tangent approximation.  If you need survey-grade accuracy over larger areas, replace the helper conversions with Mapping Toolbox functions such as `geodetic2enu` and `enu2geodetic`.
@@ -39,6 +40,9 @@ imuParams.accelNoiseStd = 0.025;
 ## Animation and real-time playback
 
 After the dead-reckoning loop, the script opens an animated 3-D flight window.  The reference UAV marker and IMU dead-reckoned estimate move along the trajectory sample by sample, while animated trails show where each has already flown.
+## Animation and real-time playback
+
+After the dead-reckoning loop, the script opens an animated 3-D flight window.  The reference UAV marker and dead-reckoned estimate move along the trajectory sample by sample, while animated trails show where each has already flown.
 
 The animation uses `animationSpeedup` to control playback speed:
 
@@ -54,6 +58,8 @@ playbackInRealTime = true;
 ```
 
 With that option enabled, each simulation update calls `pause(dt)` before the next sample is processed.
+With that option enabled, each simulation update calls `pause(dt)` before the next sample is processed.
+
 
 ## Run
 
@@ -69,3 +75,7 @@ The script prints the first time-stamped IMU dead-reckoned samples and opens:
 2. optional static summary plots comparing the curved reference trajectory with the IMU dead-reckoned trajectory;
 3. a geographic map view where sample colour represents altitude;
 4. an IMU measurement plot showing gyroscope angular velocity and accelerometer specific force.
+1. an animated 3-D local ENU view of the UAV flying over time;
+2. optional static summary plots comparing the curved reference trajectory with the dead-reckoned trajectory;
+3. a geographic map view where sample colour represents altitude.
+
